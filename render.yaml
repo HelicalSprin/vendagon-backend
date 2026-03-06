@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: vendagon-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: VENDOLITE_BASE_URL
+        value: https://ecloud.vendolite.com/api
