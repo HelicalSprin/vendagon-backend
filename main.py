@@ -357,3 +357,217 @@ def export_report(token: str):
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=vendolite_report.csv"}
     )
+
+
+# ── Sales ─────────────────────────────────────────────────────────────────────
+
+class SalesRequest(BaseModel):
+    start_date: int   # Unix ms
+    end_date: int     # Unix ms
+    machine_id: Optional[str] = None
+    page: int = 0
+    limit: int = 100
+
+class ProductSale(BaseModel):
+    product_name: str
+    product_id: str
+    qty: int
+    amount: float
+    slot: str
+
+class TransactionItem(BaseModel):
+    trx_id: int
+    machine_id: str
+    machine_display_id: str
+    amount: float
+    status: str
+    transaction_time: int
+    payment_method: str
+    products: list[ProductSale]
+
+class MachineSalesSummary(BaseModel):
+    machine_display_id: str
+    total_revenue: float
+    total_transactions: int
+    successful_transactions: int
+    failed_transactions: int
+    total_products_sold: int
+
+class SalesSummary(BaseModel):
+    total_revenue: float
+    total_transactions: int
+    successful_transactions: int
+    failed_transactions: int
+    total_refunds: float
+    total_products_sold: int
+    by_machine: list[MachineSalesSummary]
+    transactions: list[TransactionItem]
+
+def fetch_transactions(token: str, start_date: int, end_date: int, machine_id: Optional[str] = None, page: int = 0, limit: int = 100) -> list:
+    url = f"{VENDOLITE_BASE_URL}/transactions/getListV3"
+    search_options = []
+    if machine_id:
+        search_options = [{"name": "Machine Id", "autoComplete": True, "searchTexts": [machine_id]}]
+
+    payload = {
+        "currentPage": page,
+        "limit": limit,
+        "startdate": start_date,
+        "enddate": end_date,
+        "sortSelected": "transactionTime",
+        "sortDirection": "DESC",
+        "searchOptions": search_options
+    }
+    resp = requests.post(url, json=payload, headers=get_auth_header(token), timeout=30)
+    resp.raise_for_status()
+    result = resp.json()
+    return result.get("data", [])
+
+def fetch_transaction_cart(token: str, trx_id: int) -> list:
+    url = f"{VENDOLITE_BASE_URL}/transactions/getTransactionCart"
+    resp = requests.post(url, json={"id": trx_id}, headers=get_auth_header(token), timeout=15)
+    resp.raise_for_status()
+    result = resp.json()
+    return result.get("data", [])
+
+def parse_payment_method(trx: dict) -> str:
+    paid_info = trx.get("paidInfo", [])
+    if paid_info:
+        return paid_info[0].get("payment_type.name", "Unknown")
+    return "Unknown"
+
+@app.post("/sales/summary", response_model=SalesSummary)
+def get_sales_summary(body: SalesRequest, token: str):
+    """Get sales summary for a date range, optionally filtered by machine."""
+    try:
+        transactions = fetch_transactions(
+            token, body.start_date, body.end_date,
+            body.machine_id, body.page, body.limit
+        )
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=401, detail="Unauthorized — invalid or expired token")
+    except requests.RequestException as e:
+        raise HTTPException(status_code=503, detail="Vendolite API unreachable")
+
+    total_revenue = 0.0
+    total_refunds = 0.0
+    success_count = 0
+    fail_count = 0
+    total_products = 0
+    machine_map = {}
+    parsed_transactions = []
+
+    for trx in transactions:
+        status = trx.get("status", "")
+        amount = (trx.get("amountT") or 0) / 100
+        refund = (trx.get("refundAmount") or 0) / 100
+        machine_display = trx.get("machine.machineDisplayId", "Unknown")
+        machine_id_int = trx.get("machineId", 0)
+
+        if status == "SUCCESS":
+            total_revenue += amount
+            success_count += 1
+        else:
+            fail_count += 1
+        total_refunds += refund
+
+        # Fetch cart items for this transaction
+        products = []
+        try:
+            cart_items = fetch_transaction_cart(token, trx["id"])
+            for item in cart_items:
+                if item.get("status") == "SUCCESS":
+                    products.append(ProductSale(
+                        product_name=item.get("productName", "Unknown"),
+                        product_id=item.get("displayProductId", ""),
+                        qty=item.get("qty", 1),
+                        amount=(item.get("amount", 0)) / 100,
+                        slot=item.get("slotName", "")
+                    ))
+                    total_products += item.get("qty", 1)
+        except Exception:
+            pass  # Skip cart fetch errors
+
+        parsed_transactions.append(TransactionItem(
+            trx_id=trx["id"],
+            machine_id=str(machine_id_int),
+            machine_display_id=machine_display,
+            amount=amount,
+            status=status,
+            transaction_time=trx.get("transactionTime", 0),
+            payment_method=parse_payment_method(trx),
+            products=products
+        ))
+
+        # Per machine summary
+        if machine_display not in machine_map:
+            machine_map[machine_display] = {
+                "revenue": 0.0, "total": 0, "success": 0, "fail": 0, "products": 0
+            }
+        m = machine_map[machine_display]
+        m["total"] += 1
+        if status == "SUCCESS":
+            m["revenue"] += amount
+            m["success"] += 1
+        else:
+            m["fail"] += 1
+        m["products"] += len(products)
+
+    by_machine = sorted([
+        MachineSalesSummary(
+            machine_display_id=k,
+            total_revenue=v["revenue"],
+            total_transactions=v["total"],
+            successful_transactions=v["success"],
+            failed_transactions=v["fail"],
+            total_products_sold=v["products"]
+        )
+        for k, v in machine_map.items()
+    ], key=lambda x: x.total_revenue, reverse=True)
+
+    return SalesSummary(
+        total_revenue=round(total_revenue, 2),
+        total_transactions=len(transactions),
+        successful_transactions=success_count,
+        failed_transactions=fail_count,
+        total_refunds=round(total_refunds, 2),
+        total_products_sold=total_products,
+        by_machine=by_machine,
+        transactions=parsed_transactions
+    )
+
+
+@app.get("/sales/top-products")
+def get_top_products(token: str, start_date: int, end_date: int, limit: int = 20):
+    """Get top selling products across all machines for a date range."""
+    try:
+        transactions = fetch_transactions(token, start_date, end_date, limit=100)
+    except requests.RequestException:
+        raise HTTPException(status_code=503, detail="Vendolite API unreachable")
+
+    product_map = {}
+    for trx in transactions:
+        if trx.get("status") != "SUCCESS":
+            continue
+        try:
+            cart_items = fetch_transaction_cart(token, trx["id"])
+            for item in cart_items:
+                if item.get("status") == "SUCCESS":
+                    name = item.get("productName", "Unknown")
+                    pid = item.get("displayProductId", "")
+                    qty = item.get("qty", 1)
+                    amt = (item.get("amount", 0)) / 100
+                    if name not in product_map:
+                        product_map[name] = {"product_id": pid, "qty": 0, "revenue": 0.0}
+                    product_map[name]["qty"] += qty
+                    product_map[name]["revenue"] += amt
+        except Exception:
+            pass
+
+    top = sorted(
+        [{"product_name": k, **v} for k, v in product_map.items()],
+        key=lambda x: x["qty"],
+        reverse=True
+    )[:limit]
+
+    return {"data": top}
