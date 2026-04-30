@@ -387,6 +387,7 @@ class TransactionItem(BaseModel):
 
 class MachineSalesSummary(BaseModel):
     machine_display_id: str
+    machine_name: str
     total_revenue: float
     total_transactions: int
     successful_transactions: int
@@ -402,6 +403,20 @@ class SalesSummary(BaseModel):
     total_products_sold: int
     by_machine: list[MachineSalesSummary]
     transactions: list[TransactionItem]
+
+def fetch_machine_names(token: str) -> dict:
+    """Returns a dict of machineId -> addressLine1 for name lookup."""
+    try:
+        machines = fetch_machines(token)
+        result = {}
+        for m in machines:
+            mid = str(m.get("id", ""))
+            addr = m.get("addressLine1") or m.get("address") or m.get("branchName") or ""
+            display = m.get("machineDisplayId", "")
+            result[mid] = {"name": addr, "display": display}
+        return result
+    except Exception:
+        return {}
 
 def fetch_transactions(token: str, start_date: int, end_date: int, machine_id: Optional[str] = None, page: int = 0, limit: int = 100) -> list:
     url = f"{VENDOLITE_BASE_URL}/transactions/getListV3"
@@ -449,6 +464,8 @@ def get_sales_summary(body: SalesRequest, token: str):
     except requests.RequestException as e:
         raise HTTPException(status_code=503, detail="Vendolite API unreachable")
 
+    # Fetch machine names for lookup
+    machine_name_map = fetch_machine_names(token)
     total_revenue = 0.0
     total_refunds = 0.0
     success_count = 0
@@ -500,9 +517,11 @@ def get_sales_summary(body: SalesRequest, token: str):
         ))
 
         # Per machine summary
+        machine_name_str = machine_name_map.get(str(machine_id_int), {}).get("name", "")
         if machine_display not in machine_map:
             machine_map[machine_display] = {
-                "revenue": 0.0, "total": 0, "success": 0, "fail": 0, "products": 0
+                "revenue": 0.0, "total": 0, "success": 0, "fail": 0, "products": 0,
+                "name": machine_name_str
             }
         m = machine_map[machine_display]
         m["total"] += 1
@@ -516,6 +535,7 @@ def get_sales_summary(body: SalesRequest, token: str):
     by_machine = sorted([
         MachineSalesSummary(
             machine_display_id=k,
+            machine_name=v.get("name", ""),
             total_revenue=v["revenue"],
             total_transactions=v["total"],
             successful_transactions=v["success"],
@@ -571,3 +591,124 @@ def get_top_products(token: str, start_date: int, end_date: int, limit: int = 20
     )[:limit]
 
     return {"data": top}
+
+
+# ── Refill / Slot Grid ────────────────────────────────────────────────────────
+
+class SlotInfo(BaseModel):
+    slot_id: int
+    slot_name: str
+    row_number: int
+    column_number: int
+    product_name: str
+    product_id: str
+    current_qty: int
+    max_qty: int
+    enabled: bool
+    issue_found: bool
+    refill_needed: int  # how many to add to reach full
+    price: float
+    status: str  # "good", "low", "empty", "disabled", "issue"
+
+class MachineSlotData(BaseModel):
+    machine_id: int
+    machine_display_id: str
+    slots: list[SlotInfo]
+    total_slots: int
+    empty_slots: int
+    low_slots: int
+    good_slots: int
+
+def fetch_machine_slots(token: str, machine_id: int) -> list:
+    url = f"{VENDOLITE_BASE_URL}/machineSlot/getAllSlots"
+    resp = requests.post(url, json={"machineId": machine_id},
+                         headers=get_auth_header(token), timeout=30)
+    resp.raise_for_status()
+    result = resp.json()
+    return result.get("data", [])
+
+def parse_slot_status(qty: int, max_qty: int, enabled: bool, issue: bool) -> str:
+    if not enabled:
+        return "disabled"
+    if issue:
+        return "issue"
+    if qty == 0:
+        return "empty"
+    if qty / max_qty < 0.5:
+        return "low"
+    return "good"
+
+@app.get("/machines/slots/{machine_id}", response_model=MachineSlotData)
+def get_machine_slots(machine_id: int, token: str, display_id: str = ""):
+    try:
+        raw_slots = fetch_machine_slots(token, machine_id)
+    except requests.HTTPError:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    except requests.RequestException:
+        raise HTTPException(status_code=503, detail="Vendolite API unreachable")
+
+    slots = []
+    for s in raw_slots:
+        # Skip spacer slots (slotWidth == 0 and enable == 0)
+        if s.get("slotWidth", 0) == 0 and s.get("enable", 0) == 0:
+            continue
+
+        stock_list = s.get("stock", [])
+        current_qty = sum(st.get("qty", 0) for st in stock_list)
+        max_qty = s.get("stockLimit", 1) or 1
+        enabled = bool(s.get("enable", 0))
+        issue = bool(s.get("slotIssueFound", 0))
+        product_name = s.get("client_level_product.name", "Unknown")
+        product_display_id = s.get("client_level_product.displayProductId", "")
+        price = (s.get("client_level_product.cost") or 0) / 100
+        status = parse_slot_status(current_qty, max_qty, enabled, issue)
+        refill_needed = max(0, max_qty - current_qty) if enabled else 0
+
+        slots.append(SlotInfo(
+            slot_id=s["id"],
+            slot_name=s["slotName"],
+            row_number=s["rowNumber"],
+            column_number=s["coloumnNumber"],
+            product_name=product_name,
+            product_id=product_display_id,
+            current_qty=current_qty,
+            max_qty=max_qty,
+            enabled=enabled,
+            issue_found=issue,
+            refill_needed=refill_needed,
+            price=price,
+            status=status
+        ))
+
+    empty = sum(1 for s in slots if s.status == "empty")
+    low = sum(1 for s in slots if s.status == "low")
+    good = sum(1 for s in slots if s.status == "good")
+
+    return MachineSlotData(
+        machine_id=machine_id,
+        machine_display_id=display_id or str(machine_id),
+        slots=slots,
+        total_slots=len(slots),
+        empty_slots=empty,
+        low_slots=low,
+        good_slots=good
+    )
+
+
+@app.get("/machines/list")
+def get_machine_list(token: str):
+    """Returns list of machines with their IDs for refill screen."""
+    try:
+        machines = fetch_machines(token)
+        result = []
+        for m in machines:
+            result.append({
+                "id": m.get("id"),
+                "display_id": m.get("machineDisplayId", ""),
+                "address": m.get("addressLine1") or m.get("address") or "",
+                "operation_status": m.get("operationStatus", ""),
+                "cloud_status": m.get("cloudStatus", ""),
+            })
+        return {"data": result}
+    except requests.RequestException:
+        raise HTTPException(status_code=503, detail="Vendolite API unreachable")
