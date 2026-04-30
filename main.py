@@ -712,3 +712,246 @@ def get_machine_list(token: str):
         return {"data": result}
     except requests.RequestException:
         raise HTTPException(status_code=503, detail="Vendolite API unreachable")
+
+
+# ── Refill PDF Generation ─────────────────────────────────────────────────────
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from io import BytesIO
+from datetime import datetime
+import pytz
+
+def generate_refill_pdf(machines_data: list[dict], title: str = "Refill Report") -> bytes:
+    """Generate a PDF refill report for one or more machines."""
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        rightMargin=15*mm, leftMargin=15*mm,
+        topMargin=15*mm, bottomMargin=15*mm
+    )
+
+    styles = getSampleStyleSheet()
+    BLUE = colors.HexColor("#1565C0")
+    DARK = colors.HexColor("#1E293B")
+    GREEN = colors.HexColor("#16A34A")
+    ORANGE = colors.HexColor("#D97706")
+    RED = colors.HexColor("#DC2626")
+    GREY = colors.HexColor("#94A3B8")
+    LIGHT = colors.HexColor("#F1F5F9")
+
+    title_style = ParagraphStyle('title', fontSize=18, fontName='Helvetica-Bold',
+                                  textColor=BLUE, spaceAfter=4)
+    sub_style = ParagraphStyle('sub', fontSize=9, fontName='Helvetica',
+                                textColor=GREY, spaceAfter=12)
+    machine_style = ParagraphStyle('machine', fontSize=13, fontName='Helvetica-Bold',
+                                    textColor=DARK, spaceBefore=16, spaceAfter=2)
+    addr_style = ParagraphStyle('addr', fontSize=9, fontName='Helvetica',
+                                 textColor=GREY, spaceAfter=8)
+
+    # IST timezone
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(ist).strftime("%d %b %Y  %I:%M %p IST")
+
+    story = []
+
+    # ── Header ──
+    story.append(Paragraph("Vendagon Stock", title_style))
+    story.append(Paragraph(f"{title}  •  Generated: {now}", sub_style))
+    story.append(HRFlowable(width="100%", thickness=1.5, color=BLUE, spaceAfter=10))
+
+    for m in machines_data:
+        machine_display = m.get("machine_display_id", "")
+        address = m.get("address", "")
+        slots = m.get("slots", [])
+
+        # ── Machine header ──
+        story.append(Paragraph(machine_display, machine_style))
+        if address:
+            story.append(Paragraph(f"📍 {address}", addr_style))
+
+        # Summary counts
+        empty = sum(1 for s in slots if s['status'] == 'empty')
+        low = sum(1 for s in slots if s['status'] == 'low')
+        good = sum(1 for s in slots if s['status'] == 'good')
+        total_refill = sum(s['refill_needed'] for s in slots)
+
+        summary_data = [['Total Slots', 'Good', 'Low Stock', 'Empty', 'Total to Refill'],
+                        [str(len(slots)), str(good), str(low), str(empty), str(total_refill)]]
+        summary_table = Table(summary_data, colWidths=[36*mm]*5)
+        summary_table.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), BLUE),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0,0), (-1,1), 8),
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('BACKGROUND', (0,1), (-1,1), LIGHT),
+            ('FONTNAME', (0,1), (-1,1), 'Helvetica-Bold'),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#E2E8F0")),
+            ('ROWHEIGHT', (0,0), (-1,-1), 14),
+        ]))
+        story.append(summary_table)
+        story.append(Spacer(1, 8))
+
+        # ── Slot table ──
+        # Sort by urgency: empty first, then low, then good, disabled last
+        urgency = {'empty': 0, 'issue': 1, 'low': 2, 'good': 3, 'disabled': 4}
+        sorted_slots = sorted(slots, key=lambda s: urgency.get(s['status'], 5))
+
+        # Filter out disabled
+        active_slots = [s for s in sorted_slots if s['status'] != 'disabled']
+
+        if active_slots:
+            headers = ['Slot', 'Product', 'Current', 'Capacity', 'Refill', 'Status']
+            col_widths = [18*mm, 70*mm, 18*mm, 20*mm, 18*mm, 18*mm]
+            data = [headers]
+
+            for s in active_slots:
+                status = s['status']
+                data.append([
+                    s['slot_name'].replace(' x ', ''),
+                    s['product_name'],
+                    str(s['current_qty']),
+                    str(s['max_qty']),
+                    str(s['refill_needed']) if s['refill_needed'] > 0 else '✓',
+                    status.upper()
+                ])
+
+            slot_table = Table(data, colWidths=col_widths, repeatRows=1)
+            style_cmds = [
+                ('BACKGROUND', (0,0), (-1,0), DARK),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0,0), (-1,-1), 8),
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('ALIGN', (1,0), (1,-1), 'LEFT'),
+                ('GRID', (0,0), (-1,-1), 0.3, colors.HexColor("#E2E8F0")),
+                ('ROWHEIGHT', (0,0), (-1,-1), 13),
+                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ]
+            # Color rows by status
+            for i, s in enumerate(active_slots, start=1):
+                if s['status'] == 'empty':
+                    style_cmds.append(('BACKGROUND', (5,i), (5,i), RED))
+                    style_cmds.append(('TEXTCOLOR', (5,i), (5,i), colors.white))
+                    style_cmds.append(('BACKGROUND', (4,i), (4,i), colors.HexColor("#FEE2E2")))
+                elif s['status'] == 'low':
+                    style_cmds.append(('BACKGROUND', (5,i), (5,i), ORANGE))
+                    style_cmds.append(('TEXTCOLOR', (5,i), (5,i), colors.white))
+                    style_cmds.append(('BACKGROUND', (4,i), (4,i), colors.HexColor("#FEF3C7")))
+                elif s['status'] == 'good':
+                    style_cmds.append(('BACKGROUND', (5,i), (5,i), GREEN))
+                    style_cmds.append(('TEXTCOLOR', (5,i), (5,i), colors.white))
+                # Alternate row bg
+                if i % 2 == 0:
+                    style_cmds.append(('BACKGROUND', (0,i), (4,i), LIGHT))
+
+            slot_table.setStyle(TableStyle(style_cmds))
+            story.append(slot_table)
+
+        story.append(Spacer(1, 6))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#E2E8F0"), spaceAfter=4))
+
+    # Footer
+    story.append(Spacer(1, 8))
+    footer_style = ParagraphStyle('footer', fontSize=8, textColor=GREY, alignment=TA_CENTER)
+    story.append(Paragraph(f"Vendagon Stock by Adnixpro  •  {now}", footer_style))
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+@app.get("/refill/pdf/machine/{machine_id}")
+def download_machine_refill_pdf(machine_id: int, token: str, display_id: str = "", address: str = ""):
+    """Download refill PDF for a single machine."""
+    try:
+        raw_slots = fetch_machine_slots(token, machine_id)
+    except requests.RequestException:
+        raise HTTPException(status_code=503, detail="Vendolite API unreachable")
+
+    slots = []
+    for s in raw_slots:
+        if s.get("slotWidth", 0) == 0 and s.get("enable", 0) == 0:
+            continue
+        stock_list = s.get("stock", [])
+        current_qty = sum(st.get("qty", 0) for st in stock_list)
+        max_qty = s.get("stockLimit", 1) or 1
+        enabled = bool(s.get("enable", 0))
+        issue = bool(s.get("slotIssueFound", 0))
+        status = parse_slot_status(current_qty, max_qty, enabled, issue)
+        slots.append({
+            "slot_name": s["slotName"],
+            "product_name": s.get("client_level_product.name", "Unknown"),
+            "current_qty": current_qty,
+            "max_qty": max_qty,
+            "refill_needed": max(0, max_qty - current_qty) if enabled else 0,
+            "status": status,
+            "issue_found": issue,
+        })
+
+    machine_data = [{
+        "machine_display_id": display_id or str(machine_id),
+        "address": address,
+        "slots": slots
+    }]
+
+    pdf_bytes = generate_refill_pdf(machine_data, title=f"Refill Report — {display_id or machine_id}")
+    from fastapi.responses import Response
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=refill_{display_id or machine_id}.pdf"}
+    )
+
+
+@app.post("/refill/pdf/all")
+def download_all_machines_refill_pdf(token: str):
+    """Download refill PDF for ALL machines."""
+    try:
+        machines = fetch_machines(token)
+    except requests.RequestException:
+        raise HTTPException(status_code=503, detail="Vendolite API unreachable")
+
+    all_data = []
+    for m in machines:
+        mid = m.get("id")
+        display_id = m.get("machineDisplayId", str(mid))
+        address = m.get("addressLine1") or m.get("address") or ""
+        try:
+            raw_slots = fetch_machine_slots(token, mid)
+            slots = []
+            for s in raw_slots:
+                if s.get("slotWidth", 0) == 0 and s.get("enable", 0) == 0:
+                    continue
+                stock_list = s.get("stock", [])
+                current_qty = sum(st.get("qty", 0) for st in stock_list)
+                max_qty = s.get("stockLimit", 1) or 1
+                enabled = bool(s.get("enable", 0))
+                issue = bool(s.get("slotIssueFound", 0))
+                status = parse_slot_status(current_qty, max_qty, enabled, issue)
+                slots.append({
+                    "slot_name": s["slotName"],
+                    "product_name": s.get("client_level_product.name", "Unknown"),
+                    "current_qty": current_qty,
+                    "max_qty": max_qty,
+                    "refill_needed": max(0, max_qty - current_qty) if enabled else 0,
+                    "status": status,
+                    "issue_found": issue,
+                })
+            all_data.append({"machine_display_id": display_id, "address": address, "slots": slots})
+        except Exception:
+            continue
+
+    pdf_bytes = generate_refill_pdf(all_data, title="Full Fleet Refill Report")
+    from fastapi.responses import Response
+    ist = pytz.timezone("Asia/Kolkata")
+    date_str = datetime.now(ist).strftime("%Y%m%d_%H%M")
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=refill_all_{date_str}.pdf"}
+    )
