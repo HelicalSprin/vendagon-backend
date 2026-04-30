@@ -955,3 +955,51 @@ def download_all_machines_refill_pdf(token: str):
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=refill_all_{date_str}.pdf"}
     )
+
+
+class SelectedMachinesRequest(BaseModel):
+    machine_ids: list[int]
+    display_ids: list[str]
+    addresses: list[str]
+
+@app.post("/refill/pdf/selected")
+def download_selected_machines_refill_pdf(body: SelectedMachinesRequest, token: str):
+    """Download refill PDF for selected machines."""
+    all_data = []
+    for i, mid in enumerate(body.machine_ids):
+        display_id = body.display_ids[i] if i < len(body.display_ids) else str(mid)
+        address = body.addresses[i] if i < len(body.addresses) else ""
+        try:
+            raw_slots = fetch_machine_slots(token, mid)
+            slots = []
+            for s in raw_slots:
+                if s.get("slotWidth", 0) == 0 and s.get("enable", 0) == 0:
+                    continue
+                stock_list = s.get("stock", [])
+                current_qty = sum(st.get("qty", 0) for st in stock_list)
+                max_qty = s.get("stockLimit", 1) or 1
+                enabled = bool(s.get("enable", 0))
+                issue = bool(s.get("slotIssueFound", 0))
+                status = parse_slot_status(current_qty, max_qty, enabled, issue)
+                slots.append({
+                    "slot_name": s["slotName"],
+                    "product_name": s.get("client_level_product.name", "Unknown"),
+                    "current_qty": current_qty,
+                    "max_qty": max_qty,
+                    "refill_needed": max(0, max_qty - current_qty) if enabled else 0,
+                    "status": status,
+                    "issue_found": issue,
+                })
+            all_data.append({"machine_display_id": display_id, "address": address, "slots": slots})
+        except Exception:
+            continue
+
+    pdf_bytes = generate_refill_pdf(all_data, title=f"Refill Report — {len(all_data)} Machines")
+    from fastapi.responses import Response
+    ist = pytz.timezone("Asia/Kolkata")
+    date_str = datetime.now(ist).strftime("%Y%m%d_%H%M")
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=refill_selected_{date_str}.pdf"}
+    )
