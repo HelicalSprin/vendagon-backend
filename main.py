@@ -727,140 +727,97 @@ from datetime import datetime
 import pytz
 
 def generate_refill_pdf(machines_data: list[dict], title: str = "Refill Report") -> bytes:
-    """Generate a PDF refill report for one or more machines."""
     buffer = BytesIO()
-    doc = SimpleDocTemplate(
-        buffer, pagesize=A4,
-        rightMargin=15*mm, leftMargin=15*mm,
-        topMargin=15*mm, bottomMargin=15*mm
-    )
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+        rightMargin=15*mm, leftMargin=15*mm, topMargin=15*mm, bottomMargin=15*mm)
 
-    styles = getSampleStyleSheet()
-    BLUE = colors.HexColor("#1565C0")
-    DARK = colors.HexColor("#1E293B")
-    GREEN = colors.HexColor("#16A34A")
-    ORANGE = colors.HexColor("#D97706")
-    RED = colors.HexColor("#DC2626")
-    GREY = colors.HexColor("#94A3B8")
-    LIGHT = colors.HexColor("#F1F5F9")
-
-    title_style = ParagraphStyle('title', fontSize=18, fontName='Helvetica-Bold',
-                                  textColor=BLUE, spaceAfter=4)
-    sub_style = ParagraphStyle('sub', fontSize=9, fontName='Helvetica',
-                                textColor=GREY, spaceAfter=12)
-    machine_style = ParagraphStyle('machine', fontSize=13, fontName='Helvetica-Bold',
-                                    textColor=DARK, spaceBefore=16, spaceAfter=2)
-    addr_style = ParagraphStyle('addr', fontSize=9, fontName='Helvetica',
-                                 textColor=GREY, spaceAfter=8)
-
-    # IST timezone
     ist = pytz.timezone("Asia/Kolkata")
     now = datetime.now(ist).strftime("%d %b %Y  %I:%M %p IST")
 
-    story = []
+    H1 = ParagraphStyle("h1", fontSize=18, fontName="Helvetica-Bold", spaceAfter=2)
+    H2 = ParagraphStyle("h2", fontSize=11, fontName="Helvetica", textColor=colors.grey, spaceAfter=10)
+    MH = ParagraphStyle("mh", fontSize=15, fontName="Helvetica-Bold", spaceBefore=14, spaceAfter=2)
+    MA = ParagraphStyle("ma", fontSize=10, fontName="Helvetica", textColor=colors.grey, spaceAfter=6)
+    MI = ParagraphStyle("mi", fontSize=10, fontName="Helvetica-Bold", spaceAfter=6)
 
-    # ── Header ──
-    story.append(Paragraph("Vendagon Stock", title_style))
-    story.append(Paragraph(f"{title}  •  Generated: {now}", sub_style))
-    story.append(HRFlowable(width="100%", thickness=1.5, color=BLUE, spaceAfter=10))
+    story = []
+    story.append(Paragraph("Vendagon Stock — Refill Report", H1))
+    story.append(Paragraph("Generated: " + now, H2))
+    story.append(HRFlowable(width="100%", thickness=2, color=colors.black, spaceAfter=10))
 
     for m in machines_data:
         machine_display = m.get("machine_display_id", "")
         address = m.get("address", "")
         slots = m.get("slots", [])
+        active = [s for s in slots if s["status"] != "disabled"]
+        urgency = {"empty": 0, "issue": 1, "low": 2, "good": 3}
+        active = sorted(active, key=lambda s: urgency.get(s["status"], 5))
+        total_refill = sum(s["refill_needed"] for s in active)
+        empty_count = sum(1 for s in active if s["status"] == "empty")
+        low_count = sum(1 for s in active if s["status"] == "low")
 
-        # ── Machine header ──
-        story.append(Paragraph(machine_display, machine_style))
+        story.append(Paragraph(machine_display, MH))
         if address:
-            story.append(Paragraph(f"📍 {address}", addr_style))
+            story.append(Paragraph(address, MA))
+        story.append(Paragraph(
+            f"Total Slots: {len(active)}   |   Empty: {empty_count}   |   Low: {low_count}   |   Items to Refill: {total_refill}",
+            MI
+        ))
 
-        # Summary counts
-        empty = sum(1 for s in slots if s['status'] == 'empty')
-        low = sum(1 for s in slots if s['status'] == 'low')
-        good = sum(1 for s in slots if s['status'] == 'good')
-        total_refill = sum(s['refill_needed'] for s in slots)
+        headers = ["SLOT", "PRODUCT", "HAVE", "MAX", "REFILL", "STATUS"]
+        col_w = [16*mm, 84*mm, 16*mm, 16*mm, 16*mm, 22*mm]
+        data = [headers]
+        for s in active:
+            refill_val = str(s["refill_needed"]) if s["refill_needed"] > 0 else "OK"
+            data.append([
+                s["slot_name"].replace(" x ", ""),
+                s["product_name"],
+                str(s["current_qty"]),
+                str(s["max_qty"]),
+                refill_val,
+                s["status"].upper(),
+            ])
 
-        summary_data = [['Total Slots', 'Good', 'Low Stock', 'Empty', 'Total to Refill'],
-                        [str(len(slots)), str(good), str(low), str(empty), str(total_refill)]]
-        summary_table = Table(summary_data, colWidths=[36*mm]*5)
-        summary_table.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), BLUE),
-            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0,0), (-1,1), 8),
-            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-            ('BACKGROUND', (0,1), (-1,1), LIGHT),
-            ('FONTNAME', (0,1), (-1,1), 'Helvetica-Bold'),
-            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#E2E8F0")),
-            ('ROWHEIGHT', (0,0), (-1,-1), 14),
-        ]))
-        story.append(summary_table)
-        story.append(Spacer(1, 8))
+        tbl = Table(data, colWidths=col_w, repeatRows=1)
+        cmds = [
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,0), 9),
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#222222")),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("FONTNAME", (0,1), (-1,-1), "Helvetica-Bold"),
+            ("FONTSIZE", (0,1), (-1,-1), 9),
+            ("ALIGN", (0,0), (-1,-1), "CENTER"),
+            ("ALIGN", (1,0), (1,-1), "LEFT"),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("GRID", (0,0), (-1,-1), 0.5, colors.HexColor("#AAAAAA")),
+            ("ROWHEIGHT", (0,0), (-1,-1), 16),
+            ("TOPPADDING", (0,0), (-1,-1), 3),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+        ]
+        for i, s in enumerate(active, start=1):
+            if s["status"] == "empty":
+                cmds.append(("BACKGROUND", (5,i), (5,i), colors.HexColor("#CC0000")))
+                cmds.append(("TEXTCOLOR", (5,i), (5,i), colors.white))
+                cmds.append(("BACKGROUND", (4,i), (4,i), colors.HexColor("#FFCCCC")))
+            elif s["status"] == "low":
+                cmds.append(("BACKGROUND", (5,i), (5,i), colors.HexColor("#E07000")))
+                cmds.append(("TEXTCOLOR", (5,i), (5,i), colors.white))
+                cmds.append(("BACKGROUND", (4,i), (4,i), colors.HexColor("#FFE5B0")))
+            elif s["status"] == "good":
+                cmds.append(("BACKGROUND", (5,i), (5,i), colors.HexColor("#1A7A1A")))
+                cmds.append(("TEXTCOLOR", (5,i), (5,i), colors.white))
+            if i % 2 == 0:
+                cmds.append(("BACKGROUND", (0,i), (4,i), colors.HexColor("#F5F5F5")))
 
-        # ── Slot table ──
-        # Sort by urgency: empty first, then low, then good, disabled last
-        urgency = {'empty': 0, 'issue': 1, 'low': 2, 'good': 3, 'disabled': 4}
-        sorted_slots = sorted(slots, key=lambda s: urgency.get(s['status'], 5))
-
-        # Filter out disabled
-        active_slots = [s for s in sorted_slots if s['status'] != 'disabled']
-
-        if active_slots:
-            headers = ['Slot', 'Product', 'Current', 'Capacity', 'Refill', 'Status']
-            col_widths = [18*mm, 70*mm, 18*mm, 20*mm, 18*mm, 18*mm]
-            data = [headers]
-
-            for s in active_slots:
-                status = s['status']
-                data.append([
-                    s['slot_name'].replace(' x ', ''),
-                    s['product_name'],
-                    str(s['current_qty']),
-                    str(s['max_qty']),
-                    str(s['refill_needed']) if s['refill_needed'] > 0 else '✓',
-                    status.upper()
-                ])
-
-            slot_table = Table(data, colWidths=col_widths, repeatRows=1)
-            style_cmds = [
-                ('BACKGROUND', (0,0), (-1,0), DARK),
-                ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0,0), (-1,-1), 8),
-                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-                ('ALIGN', (1,0), (1,-1), 'LEFT'),
-                ('GRID', (0,0), (-1,-1), 0.3, colors.HexColor("#E2E8F0")),
-                ('ROWHEIGHT', (0,0), (-1,-1), 13),
-                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-            ]
-            # Color rows by status
-            for i, s in enumerate(active_slots, start=1):
-                if s['status'] == 'empty':
-                    style_cmds.append(('BACKGROUND', (5,i), (5,i), RED))
-                    style_cmds.append(('TEXTCOLOR', (5,i), (5,i), colors.white))
-                    style_cmds.append(('BACKGROUND', (4,i), (4,i), colors.HexColor("#FEE2E2")))
-                elif s['status'] == 'low':
-                    style_cmds.append(('BACKGROUND', (5,i), (5,i), ORANGE))
-                    style_cmds.append(('TEXTCOLOR', (5,i), (5,i), colors.white))
-                    style_cmds.append(('BACKGROUND', (4,i), (4,i), colors.HexColor("#FEF3C7")))
-                elif s['status'] == 'good':
-                    style_cmds.append(('BACKGROUND', (5,i), (5,i), GREEN))
-                    style_cmds.append(('TEXTCOLOR', (5,i), (5,i), colors.white))
-                # Alternate row bg
-                if i % 2 == 0:
-                    style_cmds.append(('BACKGROUND', (0,i), (4,i), LIGHT))
-
-            slot_table.setStyle(TableStyle(style_cmds))
-            story.append(slot_table)
-
+        tbl.setStyle(TableStyle(cmds))
+        story.append(tbl)
         story.append(Spacer(1, 6))
-        story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#E2E8F0"), spaceAfter=4))
+        story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#AAAAAA"), spaceAfter=4))
 
-    # Footer
     story.append(Spacer(1, 8))
-    footer_style = ParagraphStyle('footer', fontSize=8, textColor=GREY, alignment=TA_CENTER)
-    story.append(Paragraph(f"Vendagon Stock by Adnixpro  •  {now}", footer_style))
-
+    story.append(Paragraph("Vendagon Stock by Adnixpro  —  " + now,
+        ParagraphStyle("ft", fontSize=9, fontName="Helvetica-Bold",
+                       textColor=colors.grey, alignment=TA_CENTER)))
     doc.build(story)
     return buffer.getvalue()
 
@@ -1003,3 +960,80 @@ def download_selected_machines_refill_pdf(body: SelectedMachinesRequest, token: 
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=refill_selected_{date_str}.pdf"}
     )
+
+
+# ── Machine Groups (Supabase) ─────────────────────────────────────────────────
+import os
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
+def supabase_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
+
+@app.get("/groups")
+def get_groups():
+    """Get all machine groups from Supabase."""
+    if not SUPABASE_URL:
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+    resp = requests.get(
+        f"{SUPABASE_URL}/rest/v1/machine_groups?select=*&order=created_at.desc",
+        headers=supabase_headers(), timeout=10
+    )
+    resp.raise_for_status()
+    return {"data": resp.json()}
+
+@app.post("/groups")
+def create_group(body: dict):
+    """Create a new machine group."""
+    if not SUPABASE_URL:
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+    payload = {
+        "name": body.get("name"),
+        "machine_ids": body.get("machine_ids", []),
+        "display_ids": body.get("display_ids", []),
+        "addresses": body.get("addresses", []),
+    }
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/machine_groups",
+        headers=supabase_headers(),
+        json=payload, timeout=10
+    )
+    resp.raise_for_status()
+    return {"data": resp.json()}
+
+@app.delete("/groups/{group_id}")
+def delete_group(group_id: str):
+    """Delete a machine group."""
+    if not SUPABASE_URL:
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+    resp = requests.delete(
+        f"{SUPABASE_URL}/rest/v1/machine_groups?id=eq.{group_id}",
+        headers=supabase_headers(), timeout=10
+    )
+    resp.raise_for_status()
+    return {"success": True}
+
+@app.put("/groups/{group_id}")
+def update_group(group_id: str, body: dict):
+    """Update a machine group."""
+    if not SUPABASE_URL:
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+    payload = {
+        "name": body.get("name"),
+        "machine_ids": body.get("machine_ids", []),
+        "display_ids": body.get("display_ids", []),
+        "addresses": body.get("addresses", []),
+    }
+    resp = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/machine_groups?id=eq.{group_id}",
+        headers=supabase_headers(),
+        json=payload, timeout=10
+    )
+    resp.raise_for_status()
+    return {"success": True}
