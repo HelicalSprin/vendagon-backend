@@ -289,53 +289,19 @@ def _machine_section(story, label, address, slots, styles):
     ist = pytz.timezone("Asia/Kolkata")
     now = datetime.now(ist).strftime("%d %b %Y, %I:%M %p IST")
 
-    story.append(Paragraph(f"<b>Machine:</b> {label}", styles["h1"]))
+    # Plain text header — machine ID + name on top line, timestamp below
+    name_line = label
     if address:
-        story.append(Paragraph(f"<b>Address:</b> {address}", styles["meta"]))
-    story.append(Paragraph(f"<b>Generated:</b> {now}", styles["meta"]))
-    story.append(Spacer(1, 6))
+        name_line = f"{label}  —  {address}"
+    story.append(Paragraph(f"<b>{name_line}</b>", styles["machine_header"]))
+    story.append(Paragraph(now, styles["machine_sub"]))
+    story.append(Spacer(1, 10))
 
     if not slots:
         story.append(Paragraph("<i>No slot data available.</i>", styles["meta"]))
         return
 
     slots = sorted(slots, key=_natural_slot_key)
-
-    total = len(slots)
-    needs_refill = 0
-    disabled_count = 0
-    total_refill = 0
-    total_capacity = 0
-    total_current = 0
-    for s in slots:
-        st = (s.get("status") or "").lower()
-        if st == "disabled":
-            disabled_count += 1
-            continue
-        if st in ("empty", "low", "issue"):
-            needs_refill += 1
-        cur = int(s.get("current_qty", 0) or 0)
-        mx = int(s.get("max_qty", 0) or 0)
-        total_current += cur
-        total_capacity += mx
-        total_refill += max(0, mx - cur)
-
-    story.append(
-        Paragraph(
-            f"Total slots: <b>{total}</b> &nbsp; "
-            f"Current: <b>{total_current}</b> / <b>{total_capacity}</b> &nbsp; "
-            f"Units to refill: <b>{total_refill}</b>",
-            styles["meta"],
-        )
-    )
-    story.append(
-        Paragraph(
-            f"Slots needing refill: <b>{needs_refill}</b> &nbsp; "
-            f"Disabled: <b>{disabled_count}</b>",
-            styles["meta"],
-        )
-    )
-    story.append(Spacer(1, 12))
 
     rows: dict = {}
     for s in slots:
@@ -482,6 +448,8 @@ def generate_refill_pdf(machines_data: List[dict]) -> bytes:
     styles = {
         "h1": ParagraphStyle("h1", parent=base["Heading1"], fontSize=14, spaceAfter=2),
         "meta": ParagraphStyle("meta", parent=base["Normal"], fontSize=9, leading=11),
+        "machine_header": ParagraphStyle("machine_header", parent=base["Normal"], fontSize=18, leading=22, textColor=colors.black),
+        "machine_sub": ParagraphStyle("machine_sub", parent=base["Normal"], fontSize=10, leading=12, textColor=colors.HexColor("#666666")),
         "row_band": ParagraphStyle("row_band", parent=base["Normal"], fontSize=11, leading=14, textColor=colors.white),
         "th": ParagraphStyle("th", parent=base["Normal"], fontSize=9, alignment=1, textColor=colors.HexColor("#003B80")),
         "td": ParagraphStyle("td", parent=base["Normal"], fontSize=9, leading=12),
