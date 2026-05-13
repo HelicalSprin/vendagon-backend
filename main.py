@@ -134,15 +134,66 @@ def parse_slot_status(qty: int, max_qty: int, enabled: bool, issue: bool) -> str
     return "good"
 
 
+def _extract_current_qty(raw: dict) -> int:
+    """Vendolite returns slot quantity in different places depending on the
+    machine/firmware. Try every known location and use the first non-zero one,
+    falling back to 0 only if nothing is set anywhere.
+    """
+    # 1. Nested stock array — sum of qty across stock entries
+    stock_list = raw.get("stock") or []
+    if isinstance(stock_list, list) and stock_list:
+        total = 0
+        found_any = False
+        for st in stock_list:
+            if not isinstance(st, dict):
+                continue
+            for key in ("qty", "quantity", "currentQty", "stockQty", "remainingQty"):
+                if key in st and st[key] is not None:
+                    try:
+                        total += int(st[key])
+                        found_any = True
+                        break
+                    except (TypeError, ValueError):
+                        pass
+        if found_any:
+            return total
+
+    # 2. Top-level fields on the slot itself
+    for key in (
+        "currentQty", "current_qty", "currentQuantity",
+        "qty", "quantity",
+        "stockQty", "remainingQty",
+        "currentStock", "stockCount",
+    ):
+        if key in raw and raw[key] is not None:
+            try:
+                return int(raw[key])
+            except (TypeError, ValueError):
+                pass
+
+    return 0
+
+
+def _extract_max_qty(raw: dict) -> int:
+    for key in ("stockLimit", "maxQty", "max_qty", "capacity", "maxCapacity"):
+        if key in raw and raw[key] is not None:
+            try:
+                v = int(raw[key])
+                if v > 0:
+                    return v
+            except (TypeError, ValueError):
+                pass
+    return 1
+
+
 def normalize_slot(raw: dict) -> Optional[dict]:
     """Turn a raw Vendolite slot into the canonical shape used by the PDF."""
     # Skip spacer/disabled-width slots
     if raw.get("slotWidth", 0) == 0 and raw.get("enable", 0) == 0:
         return None
 
-    stock_list = raw.get("stock", [])
-    current_qty = sum(st.get("qty", 0) for st in stock_list)
-    max_qty = raw.get("stockLimit", 1) or 1
+    current_qty = _extract_current_qty(raw)
+    max_qty = _extract_max_qty(raw)
     enabled = bool(raw.get("enable", 0))
     issue = bool(raw.get("slotIssueFound", 0))
     status = parse_slot_status(current_qty, max_qty, enabled, issue)
@@ -647,3 +698,16 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/debug/raw_slots/{machine_id}")
+def debug_raw_slots(machine_id: int, token: str):
+    """Return the unparsed Vendolite slot payload so we can debug field shapes."""
+    try:
+        raw = fetch_machine_slots(token, machine_id)
+    except requests.HTTPError:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    except requests.RequestException:
+        raise HTTPException(status_code=503, detail="Vendolite API unreachable")
+    # Return only the first 3 slots to keep the response small
+    return {"machine_id": machine_id, "sample_slots": raw[:3], "total": len(raw)}
