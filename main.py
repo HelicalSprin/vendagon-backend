@@ -12,6 +12,7 @@ import logging
 import requests
 from datetime import datetime
 from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytz
 from fastapi import FastAPI, HTTPException
@@ -308,6 +309,159 @@ def get_machine_slots(machine_id: int, token: str, display_id: str = ""):
         "low_slots": low,
         "good_slots": good,
     }
+
+
+def _machine_stock_summary(token: str, machine: dict) -> dict:
+    """Fetch slot data for one machine and return a compact summary.
+    Used by /machines/stock/summary — runs in a thread pool.
+    """
+    mid = machine.get("id")
+    display_id = str(machine.get("machineDisplayId") or mid)
+    address = str(machine.get("addressLine1") or machine.get("address") or "")
+    base = {
+        "id": int(mid) if mid is not None else None,
+        "display_id": display_id,
+        "address": address,
+        "configured": bool(address.strip()),
+    }
+    try:
+        raw_slots = fetch_machine_slots(token, mid)
+    except Exception as e:
+        logger.warning(f"Stock summary skip {mid}: {e}")
+        return {
+            **base,
+            "total_slots": 0,
+            "active_slots": 0,
+            "empty_slots": 0,
+            "low_slots": 0,
+            "good_slots": 0,
+            "issue_slots": 0,
+            "refill_needed": 0,
+            "fill_percent": 0.0,
+            "health": "unknown",
+            "fetch_failed": True,
+        }
+
+    empty = low = good = issue = disabled = 0
+    total_cur = total_cap = total_refill = 0
+    for raw in raw_slots:
+        norm = normalize_slot(raw)
+        if not norm:
+            continue
+        st = norm["status"]
+        if st == "disabled":
+            disabled += 1
+            continue
+        if st == "empty":
+            empty += 1
+        elif st == "low":
+            low += 1
+        elif st == "good":
+            good += 1
+        elif st == "issue":
+            issue += 1
+        total_cur += int(norm.get("current_qty", 0) or 0)
+        total_cap += int(norm.get("max_qty", 0) or 0)
+        total_refill += int(norm.get("refill_needed", 0) or 0)
+
+    active = empty + low + good + issue
+    fill_pct = round((total_cur / total_cap * 100), 1) if total_cap > 0 else 0.0
+
+    if active == 0:
+        health = "unknown"
+    elif empty > 0 or issue > 0:
+        health = "critical"
+    elif low > 0:
+        health = "low"
+    else:
+        health = "good"
+
+    return {
+        **base,
+        "total_slots": active + disabled,
+        "active_slots": active,
+        "empty_slots": empty,
+        "low_slots": low,
+        "good_slots": good,
+        "issue_slots": issue,
+        "disabled_slots": disabled,
+        "refill_needed": total_refill,
+        "fill_percent": fill_pct,
+        "health": health,
+        "fetch_failed": False,
+    }
+
+
+@app.get("/machines/stock/summary")
+def stock_summary(token: str):
+    """Return health summary for every machine, in parallel.
+
+    Response shape:
+    {
+      "totals": {
+        "machines": int, "critical": int, "low": int, "good": int,
+        "unconfigured": int, "total_refill_needed": int
+      },
+      "machines": [ ... per-machine summaries, sorted by health worst-first ... ]
+    }
+    """
+    try:
+        machines = fetch_machines(token)
+    except requests.HTTPError:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    except requests.RequestException:
+        raise HTTPException(status_code=503, detail="Vendolite API unreachable")
+
+    if not machines:
+        return {
+            "totals": {
+                "machines": 0,
+                "critical": 0,
+                "low": 0,
+                "good": 0,
+                "unconfigured": 0,
+                "total_refill_needed": 0,
+            },
+            "machines": [],
+        }
+
+    # Parallel fetch — capped to avoid hammering Vendolite all at once
+    max_workers = min(20, len(machines))
+    summaries: List[dict] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(_machine_stock_summary, token, m): m for m in machines
+        }
+        for fut in as_completed(futures):
+            try:
+                summaries.append(fut.result())
+            except Exception as e:
+                logger.warning(f"Stock summary future failed: {e}")
+
+    # Sort: configured machines first, by health worst-first then by refill count.
+    # Unconfigured machines go at the bottom.
+    health_rank = {"critical": 0, "low": 1, "good": 2, "unknown": 3}
+    def sort_key(s):
+        configured_rank = 0 if s.get("configured") else 1
+        return (
+            configured_rank,
+            health_rank.get(s.get("health"), 4),
+            -int(s.get("refill_needed", 0) or 0),
+            (s.get("address") or "").lower(),
+            s.get("display_id", ""),
+        )
+    summaries.sort(key=sort_key)
+
+    totals = {
+        "machines": len(summaries),
+        "critical": sum(1 for s in summaries if s.get("configured") and s["health"] == "critical"),
+        "low": sum(1 for s in summaries if s.get("configured") and s["health"] == "low"),
+        "good": sum(1 for s in summaries if s.get("configured") and s["health"] == "good"),
+        "unconfigured": sum(1 for s in summaries if not s.get("configured")),
+        "total_refill_needed": sum(int(s.get("refill_needed", 0) or 0) for s in summaries),
+    }
+
+    return {"totals": totals, "machines": summaries}
 
 
 # ── PDF generator (new row-grouped design) ──────────────────────────────
