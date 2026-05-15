@@ -1,7 +1,7 @@
 """
 Vendagon Refill Backend
 - Proxies Vendolite API (login, machines, slots)
-- Generates row-grouped PDF refill reports
+- Generates row-grouped PDF refill reports (parallel slot fetching)
 - Manages machine_groups via Supabase
 """
 
@@ -15,10 +15,10 @@ from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytz
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -41,12 +41,12 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Vendagon Refill API",
     description="Backend for Vendagon Refill Mobile App",
-    version="2.0.0",
+    version="2.1.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Acceptable: API consumed by mobile app only.
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -58,6 +58,10 @@ VENDOLITE_BASE_URL = os.getenv(
 )
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
+# Health % thresholds — single source of truth, matched by the Flutter client.
+HEALTH_THRESHOLD_CRITICAL = 30.0
+HEALTH_THRESHOLD_LOW = 60.0
 
 # ── Models ───────────────────────────────────────────────────────────────
 class LoginRequest(BaseModel):
@@ -76,7 +80,32 @@ class SelectedMachinesRequest(BaseModel):
     addresses: List[str] = []
 
 
-# ── Vendolite helpers (kept identical to working version) ───────────────
+class GroupRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    machine_ids: List[int] = []
+    display_ids: List[str] = []
+    addresses: List[str] = []
+
+
+# ── Token extraction (accepts both header and legacy query param) ────────
+def extract_token(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    token: Optional[str] = Query(default=None),
+) -> str:
+    """Prefer Authorization: Bearer; fall back to ?token=... for back-compat
+    with older clients still in the field. New code should always use the
+    header form to keep tokens out of access logs."""
+    if authorization:
+        if authorization.lower().startswith("bearer "):
+            return authorization[7:].strip()
+        return authorization.strip()
+    if token:
+        return token
+    raise HTTPException(status_code=401, detail="Missing auth token")
+
+
+# ── Vendolite helpers ────────────────────────────────────────────────────
 def get_auth_header(token: str) -> dict:
     return {
         "accept": "application/json, text/plain, */*",
@@ -100,14 +129,12 @@ def fetch_machines(token: str, limit: int = 1000) -> list:
     resp = requests.post(url, json=payload, headers=get_auth_header(token), timeout=30)
     resp.raise_for_status()
     result = resp.json()
-
-    machines = []
     if "data" in result:
         if isinstance(result["data"], list):
-            machines = result["data"]
-        elif isinstance(result["data"], dict) and "machines" in result["data"]:
-            machines = result["data"]["machines"]
-    return machines
+            return result["data"]
+        if isinstance(result["data"], dict) and "machines" in result["data"]:
+            return result["data"]["machines"]
+    return []
 
 
 def fetch_machine_slots(token: str, machine_id: int) -> list:
@@ -119,8 +146,7 @@ def fetch_machine_slots(token: str, machine_id: int) -> list:
         timeout=30,
     )
     resp.raise_for_status()
-    result = resp.json()
-    return result.get("data", [])
+    return resp.json().get("data", [])
 
 
 def parse_slot_status(qty: int, max_qty: int, enabled: bool, issue: bool) -> str:
@@ -135,66 +161,58 @@ def parse_slot_status(qty: int, max_qty: int, enabled: bool, issue: bool) -> str
     return "good"
 
 
-def _extract_current_qty(raw: dict) -> int:
-    """Vendolite returns slot quantity in different places depending on the
-    machine/firmware. Try every known location and use the first non-zero one,
-    falling back to 0 only if nothing is set anywhere.
-    """
-    # 1. Nested stock array — sum of qty across stock entries
-    stock_list = raw.get("stock") or []
-    if isinstance(stock_list, list) and stock_list:
-        total = 0
-        found_any = False
-        for st in stock_list:
-            if not isinstance(st, dict):
-                continue
-            for key in ("qty", "quantity", "currentQty", "stockQty", "remainingQty"):
-                if key in st and st[key] is not None:
-                    try:
-                        total += int(st[key])
-                        found_any = True
-                        break
-                    except (TypeError, ValueError):
-                        pass
-        if found_any:
-            return total
-
-    # 2. Top-level fields on the slot itself
-    for key in (
-        "currentQty", "current_qty", "currentQuantity",
-        "qty", "quantity",
-        "stockQty", "remainingQty",
-        "currentStock", "stockCount",
-    ):
-        if key in raw and raw[key] is not None:
-            try:
-                return int(raw[key])
-            except (TypeError, ValueError):
-                pass
-
-    return 0
-
-
-def _extract_max_qty(raw: dict) -> int:
-    for key in ("stockLimit", "maxQty", "max_qty", "capacity", "maxCapacity"):
-        if key in raw and raw[key] is not None:
-            try:
-                v = int(raw[key])
-                if v > 0:
-                    return v
-            except (TypeError, ValueError):
-                pass
-    return 1
+def _product_name(raw: dict) -> str:
+    """Vendolite returns product info either as a nested object OR as
+    dotted-key flat fields. Try both."""
+    # Flat dotted key (what we've observed in production)
+    flat = raw.get("client_level_product.name")
+    if flat:
+        return str(flat)
+    # Nested object (defensive)
+    nested = raw.get("client_level_product")
+    if isinstance(nested, dict):
+        n = nested.get("name")
+        if n:
+            return str(n)
+    return "Unknown"
 
 
 def normalize_slot(raw: dict) -> Optional[dict]:
     """Turn a raw Vendolite slot into the canonical shape used by the PDF."""
-    # Skip spacer/disabled-width slots
     if raw.get("slotWidth", 0) == 0 and raw.get("enable", 0) == 0:
         return None
 
-    current_qty = _extract_current_qty(raw)
-    max_qty = _extract_max_qty(raw)
+    stock_list = raw.get("stock") or []
+    current_qty = 0
+    if isinstance(stock_list, list):
+        for s in stock_list:
+            if isinstance(s, dict):
+                for k in ("qty", "quantity", "currentQty"):
+                    if k in s and s[k] is not None:
+                        try:
+                            current_qty += int(s[k])
+                        except (TypeError, ValueError):
+                            pass
+                        break
+    # Fall back to top-level current* fields if stock array is empty
+    if current_qty == 0:
+        for k in ("currentStock", "currentQty", "qty", "quantity"):
+            v = raw.get(k)
+            if v is not None:
+                try:
+                    current_qty = int(v)
+                    break
+                except (TypeError, ValueError):
+                    pass
+
+    max_qty = raw.get("stockLimit") or 1
+    try:
+        max_qty = int(max_qty)
+    except (TypeError, ValueError):
+        max_qty = 1
+    if max_qty <= 0:
+        max_qty = 1
+
     enabled = bool(raw.get("enable", 0))
     issue = bool(raw.get("slotIssueFound", 0))
     status = parse_slot_status(current_qty, max_qty, enabled, issue)
@@ -203,7 +221,7 @@ def normalize_slot(raw: dict) -> Optional[dict]:
         "slot_name": raw.get("slotName", "?"),
         "row_number": raw.get("rowNumber"),
         "column_number": raw.get("coloumnNumber"),  # Vendolite's spelling
-        "product_name": raw.get("client_level_product.name") or "Unknown",
+        "product_name": _product_name(raw),
         "current_qty": current_qty,
         "max_qty": max_qty,
         "enabled": enabled,
@@ -230,8 +248,15 @@ def login(body: LoginRequest):
         if "token" not in result:
             raise HTTPException(status_code=401, detail="Invalid credentials")
         return TokenResponse(token=result["token"], message="Login successful")
-    except requests.HTTPError:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    except requests.HTTPError as exc:
+        # Don't mask infrastructure errors as auth failures.
+        status = getattr(getattr(exc, "response", None), "status_code", 500)
+        if status in (401, 403):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Vendolite returned an error ({status})",
+        )
     except requests.RequestException as e:
         logger.error(f"Login request failed: {e}")
         raise HTTPException(status_code=503, detail="Vendolite API unreachable")
@@ -239,16 +264,15 @@ def login(body: LoginRequest):
 
 # ── Machines ─────────────────────────────────────────────────────────────
 @app.get("/machines/list")
-def get_machine_list(token: str):
-    """List all machines for the refill screen.
-
-    Resilient: a single bad record won't drop the others.
-    Returns {data: [...], skipped: N, count: N}.
-    """
+def get_machine_list(request: Request):
+    token = extract_token(request, request.headers.get("authorization"))
     try:
         machines = fetch_machines(token)
-    except requests.HTTPError:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    except requests.HTTPError as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", 500)
+        if status == 401:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        raise HTTPException(status_code=502, detail="Vendolite error")
     except requests.RequestException:
         raise HTTPException(status_code=503, detail="Vendolite API unreachable")
 
@@ -277,12 +301,15 @@ def get_machine_list(token: str):
 
 
 @app.get("/machines/slots/{machine_id}")
-def get_machine_slots(machine_id: int, token: str, display_id: str = ""):
-    """Return slot grid for one machine."""
+def get_machine_slots(machine_id: int, request: Request, display_id: str = ""):
+    token = extract_token(request, request.headers.get("authorization"))
     try:
         raw_slots = fetch_machine_slots(token, machine_id)
-    except requests.HTTPError:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    except requests.HTTPError as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", 500)
+        if status == 401:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        raise HTTPException(status_code=502, detail="Vendolite error")
     except requests.RequestException:
         raise HTTPException(status_code=503, detail="Vendolite API unreachable")
 
@@ -311,165 +338,8 @@ def get_machine_slots(machine_id: int, token: str, display_id: str = ""):
     }
 
 
-def _machine_stock_summary(token: str, machine: dict) -> dict:
-    """Fetch slot data for one machine and return a compact summary.
-    Used by /machines/stock/summary — runs in a thread pool.
-    """
-    mid = machine.get("id")
-    display_id = str(machine.get("machineDisplayId") or mid)
-    address = str(machine.get("addressLine1") or machine.get("address") or "")
-    base = {
-        "id": int(mid) if mid is not None else None,
-        "display_id": display_id,
-        "address": address,
-        "configured": bool(address.strip()),
-    }
-    try:
-        raw_slots = fetch_machine_slots(token, mid)
-    except Exception as e:
-        logger.warning(f"Stock summary skip {mid}: {e}")
-        return {
-            **base,
-            "total_slots": 0,
-            "active_slots": 0,
-            "empty_slots": 0,
-            "low_slots": 0,
-            "good_slots": 0,
-            "issue_slots": 0,
-            "refill_needed": 0,
-            "fill_percent": 0.0,
-            "health": "unknown",
-            "fetch_failed": True,
-        }
-
-    empty = low = good = issue = disabled = 0
-    total_cur = total_cap = total_refill = 0
-    for raw in raw_slots:
-        norm = normalize_slot(raw)
-        if not norm:
-            continue
-        st = norm["status"]
-        if st == "disabled":
-            disabled += 1
-            continue
-        if st == "empty":
-            empty += 1
-        elif st == "low":
-            low += 1
-        elif st == "good":
-            good += 1
-        elif st == "issue":
-            issue += 1
-        total_cur += int(norm.get("current_qty", 0) or 0)
-        total_cap += int(norm.get("max_qty", 0) or 0)
-        total_refill += int(norm.get("refill_needed", 0) or 0)
-
-    active = empty + low + good + issue
-    fill_pct = round((total_cur / total_cap * 100), 1) if total_cap > 0 else 0.0
-
-    # Health is driven by overall fill percentage so it matches the visual bar.
-    # Critical < 30%, Low < 60%, Good ≥ 60%. "unknown" only when there are no
-    # active slots at all (machine has no stock data yet).
-    if active == 0 or total_cap == 0:
-        health = "unknown"
-    elif fill_pct < 30:
-        health = "critical"
-    elif fill_pct < 60:
-        health = "low"
-    else:
-        health = "good"
-
-    return {
-        **base,
-        "total_slots": active + disabled,
-        "active_slots": active,
-        "empty_slots": empty,
-        "low_slots": low,
-        "good_slots": good,
-        "issue_slots": issue,
-        "disabled_slots": disabled,
-        "refill_needed": total_refill,
-        "fill_percent": fill_pct,
-        "health": health,
-        "fetch_failed": False,
-    }
-
-
-@app.get("/machines/stock/summary")
-def stock_summary(token: str):
-    """Return health summary for every machine, in parallel.
-
-    Response shape:
-    {
-      "totals": {
-        "machines": int, "critical": int, "low": int, "good": int,
-        "unconfigured": int, "total_refill_needed": int
-      },
-      "machines": [ ... per-machine summaries, sorted by health worst-first ... ]
-    }
-    """
-    try:
-        machines = fetch_machines(token)
-    except requests.HTTPError:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    except requests.RequestException:
-        raise HTTPException(status_code=503, detail="Vendolite API unreachable")
-
-    if not machines:
-        return {
-            "totals": {
-                "machines": 0,
-                "critical": 0,
-                "low": 0,
-                "good": 0,
-                "unconfigured": 0,
-                "total_refill_needed": 0,
-            },
-            "machines": [],
-        }
-
-    # Parallel fetch — capped to avoid hammering Vendolite all at once
-    max_workers = min(20, len(machines))
-    summaries: List[dict] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {
-            pool.submit(_machine_stock_summary, token, m): m for m in machines
-        }
-        for fut in as_completed(futures):
-            try:
-                summaries.append(fut.result())
-            except Exception as e:
-                logger.warning(f"Stock summary future failed: {e}")
-
-    # Sort: configured machines first, by health worst-first then by refill count.
-    # Unconfigured machines go at the bottom.
-    health_rank = {"critical": 0, "low": 1, "good": 2, "unknown": 3}
-    def sort_key(s):
-        configured_rank = 0 if s.get("configured") else 1
-        return (
-            configured_rank,
-            health_rank.get(s.get("health"), 4),
-            -int(s.get("refill_needed", 0) or 0),
-            (s.get("address") or "").lower(),
-            s.get("display_id", ""),
-        )
-    summaries.sort(key=sort_key)
-
-    totals = {
-        "machines": len(summaries),
-        "critical": sum(1 for s in summaries if s.get("configured") and s["health"] == "critical"),
-        "low": sum(1 for s in summaries if s.get("configured") and s["health"] == "low"),
-        "good": sum(1 for s in summaries if s.get("configured") and s["health"] == "good"),
-        "unconfigured": sum(1 for s in summaries if not s.get("configured")),
-        "total_refill_needed": sum(int(s.get("refill_needed", 0) or 0) for s in summaries),
-    }
-
-    return {"totals": totals, "machines": summaries}
-
-
-# ── PDF generator (new row-grouped design) ──────────────────────────────
+# ── PDF generator (row-grouped design) ──────────────────────────────────
 def _natural_slot_key(s: dict):
-    """Sort by (row, column) for natural A1, A2, ... B1, B2 order."""
     r = s.get("row_number")
     c = s.get("column_number")
     if isinstance(r, int) and isinstance(c, int):
@@ -486,6 +356,9 @@ def _natural_slot_key(s: dict):
 
 
 def _row_letter(n: int) -> str:
+    """1→A, 2→B, ..., 26→Z, 27→AA. Matches Flutter _rowLabel."""
+    if n <= 0:
+        return "?"
     s = ""
     while n > 0:
         n, r = divmod(n - 1, 26)
@@ -497,7 +370,6 @@ def _machine_section(story, label, address, slots, styles):
     ist = pytz.timezone("Asia/Kolkata")
     now = datetime.now(ist).strftime("%d %b %Y, %I:%M %p IST")
 
-    # Plain text header — machine ID + name on top line, timestamp below
     name_line = label
     if address:
         name_line = f"{label}  —  {address}"
@@ -578,15 +450,13 @@ def _machine_section(story, label, address, slots, styles):
             name = s.get("slot_name", "?")
             product = s.get("product_name") or "-"
             if st == "disabled":
-                data.append(
-                    [
-                        Paragraph(f"<b>{name}</b>", styles["td"]),
-                        Paragraph("<i>disabled</i>", styles["td_muted"]),
-                        Paragraph("—", styles["td_muted"]),
-                        Paragraph("—", styles["td_muted"]),
-                        Paragraph("—", styles["td_muted"]),
-                    ]
-                )
+                data.append([
+                    Paragraph(f"<b>{name}</b>", styles["td"]),
+                    Paragraph("<i>disabled</i>", styles["td_muted"]),
+                    Paragraph("—", styles["td_muted"]),
+                    Paragraph("—", styles["td_muted"]),
+                    Paragraph("—", styles["td_muted"]),
+                ])
                 continue
             cur = int(s.get("current_qty", 0) or 0)
             mx = int(s.get("max_qty", 0) or 0)
@@ -596,31 +466,27 @@ def _machine_section(story, label, address, slots, styles):
                 if refill > 0
                 else '<font color="#999999">0</font>'
             )
-            data.append(
-                [
-                    Paragraph(f"<b>{name}</b>", styles["td"]),
-                    Paragraph(product, styles["td"]),
-                    Paragraph(f'<font size="11"><b>{cur}</b></font>', styles["td"]),
-                    Paragraph(str(mx), styles["td"]),
-                    Paragraph(refill_cell, styles["td"]),
-                ]
-            )
+            data.append([
+                Paragraph(f"<b>{name}</b>", styles["td"]),
+                Paragraph(product, styles["td"]),
+                Paragraph(f'<font size="11"><b>{cur}</b></font>', styles["td"]),
+                Paragraph(str(mx), styles["td"]),
+                Paragraph(refill_cell, styles["td"]),
+            ])
 
         t = Table(data, colWidths=col_widths, repeatRows=1)
-        ts = TableStyle(
-            [
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CCCCCC")),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EAF2FF")),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("ALIGN", (0, 0), (0, -1), "CENTER"),
-                ("ALIGN", (1, 0), (1, -1), "LEFT"),
-                ("ALIGN", (2, 0), (-1, -1), "CENTER"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                ("TOPPADDING", (0, 0), (-1, -1), 5),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-            ]
-        )
+        ts = TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CCCCCC")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EAF2FF")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ALIGN", (0, 0), (0, -1), "CENTER"),
+            ("ALIGN", (1, 0), (1, -1), "LEFT"),
+            ("ALIGN", (2, 0), (-1, -1), "CENTER"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ])
         for i, s in enumerate(row_slots, start=1):
             st = (s.get("status") or "").lower()
             if st in ("empty", "low", "issue"):
@@ -643,15 +509,11 @@ def _machine_section(story, label, address, slots, styles):
 def generate_refill_pdf(machines_data: List[dict]) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
-        buf,
-        pagesize=A4,
-        leftMargin=15 * mm,
-        rightMargin=15 * mm,
-        topMargin=15 * mm,
-        bottomMargin=15 * mm,
+        buf, pagesize=A4,
+        leftMargin=15 * mm, rightMargin=15 * mm,
+        topMargin=15 * mm, bottomMargin=15 * mm,
         title="Vendagon Refill Report",
     )
-
     base = getSampleStyleSheet()
     styles = {
         "h1": ParagraphStyle("h1", parent=base["Heading1"], fontSize=14, spaceAfter=2),
@@ -663,7 +525,6 @@ def generate_refill_pdf(machines_data: List[dict]) -> bytes:
         "td": ParagraphStyle("td", parent=base["Normal"], fontSize=9, leading=12),
         "td_muted": ParagraphStyle("td_muted", parent=base["Normal"], fontSize=9, leading=12, textColor=colors.HexColor("#888888")),
     }
-
     story = []
     for i, m in enumerate(machines_data):
         if i > 0:
@@ -675,13 +536,23 @@ def generate_refill_pdf(machines_data: List[dict]) -> bytes:
             m.get("slots", []),
             styles,
         )
-
     doc.build(story)
     return buf.getvalue()
 
 
+class _AuthExpired(Exception):
+    """Raised when a Vendolite call returns 401 mid-batch — surfaces all the
+    way up so the user can re-login."""
+
+
 def _build_machine_data(token: str, machine_id: int, display_id: str, address: str) -> dict:
-    raw_slots = fetch_machine_slots(token, machine_id)
+    try:
+        raw_slots = fetch_machine_slots(token, machine_id)
+    except requests.HTTPError as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", 500)
+        if status == 401:
+            raise _AuthExpired()
+        raise
     slots = [s for s in (normalize_slot(r) for r in raw_slots) if s]
     return {
         "machine_id": machine_id,
@@ -689,6 +560,37 @@ def _build_machine_data(token: str, machine_id: int, display_id: str, address: s
         "address": address or "",
         "slots": slots,
     }
+
+
+def _build_many_machines_parallel(
+    token: str,
+    triples: List[tuple],  # [(machine_id, display_id, address), ...]
+    max_workers: int = 12,
+) -> List[dict]:
+    """Fetch slots for many machines in parallel. Preserves input order.
+    Raises _AuthExpired immediately on the first 401 (so we don't waste calls)."""
+    if not triples:
+        return []
+    results: List[Optional[dict]] = [None] * len(triples)
+    workers = min(max_workers, len(triples))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_build_machine_data, token, mid, did, addr): i
+            for i, (mid, did, addr) in enumerate(triples)
+        }
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            try:
+                results[idx] = fut.result()
+            except _AuthExpired:
+                # Cancel anything still queued and bubble up
+                for f in futures:
+                    f.cancel()
+                raise
+            except Exception as e:
+                logger.warning(f"Skipped machine in PDF batch: {e}")
+                results[idx] = None
+    return [r for r in results if r is not None]
 
 
 def _pdf_filename(prefix: str = "refill") -> str:
@@ -699,75 +601,181 @@ def _pdf_filename(prefix: str = "refill") -> str:
 # ── PDF endpoints ────────────────────────────────────────────────────────
 @app.get("/refill/pdf/machine/{machine_id}")
 def download_machine_refill_pdf(
-    machine_id: int, token: str, display_id: str = "", address: str = ""
+    machine_id: int,
+    request: Request,
+    display_id: str = "",
+    address: str = "",
 ):
+    token = extract_token(request, request.headers.get("authorization"))
     try:
         data = _build_machine_data(token, machine_id, display_id, address)
-    except requests.HTTPError:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    except _AuthExpired:
+        raise HTTPException(status_code=401, detail="Session expired")
+    except requests.HTTPError as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", 500)
+        raise HTTPException(status_code=502, detail=f"Vendolite error ({status})")
     except requests.RequestException:
         raise HTTPException(status_code=503, detail="Vendolite API unreachable")
+
+    if not data.get("slots"):
+        raise HTTPException(status_code=422, detail="Machine has no slot data")
 
     pdf_bytes = generate_refill_pdf([data])
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'attachment; filename="{_pdf_filename()}"'
-        },
+        headers={"Content-Disposition": f'attachment; filename="{_pdf_filename()}"'},
     )
 
 
 @app.post("/refill/pdf/selected")
-def download_selected_refill_pdf(body: SelectedMachinesRequest, token: str):
-    all_data = []
+def download_selected_refill_pdf(body: SelectedMachinesRequest, request: Request):
+    token = extract_token(request, request.headers.get("authorization"))
+    if not body.machine_ids:
+        raise HTTPException(status_code=422, detail="No machines selected")
+
+    triples = []
     for i, mid in enumerate(body.machine_ids):
-        display_id = body.display_ids[i] if i < len(body.display_ids) else str(mid)
-        address = body.addresses[i] if i < len(body.addresses) else ""
-        try:
-            all_data.append(_build_machine_data(token, mid, display_id, address))
-        except Exception as e:
-            logger.warning(f"Skipped machine {mid} in selected PDF: {e}")
-            continue
+        did = body.display_ids[i] if i < len(body.display_ids) else str(mid)
+        addr = body.addresses[i] if i < len(body.addresses) else ""
+        triples.append((mid, did, addr))
+
+    try:
+        all_data = _build_many_machines_parallel(token, triples)
+    except _AuthExpired:
+        raise HTTPException(status_code=401, detail="Session expired")
+
+    if not all_data:
+        raise HTTPException(
+            status_code=422,
+            detail="No machine data could be fetched. Try again or check connectivity.",
+        )
+
     pdf_bytes = generate_refill_pdf(all_data)
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'attachment; filename="{_pdf_filename()}"'
-        },
+        headers={"Content-Disposition": f'attachment; filename="{_pdf_filename()}"'},
     )
 
 
-@app.post("/refill/pdf/all")
-def download_all_refill_pdf(token: str):
+# ── Stock summary (kept for future use / dashboards) ────────────────────
+def _machine_stock_summary(token: str, machine: dict) -> dict:
+    mid = machine.get("id")
+    display_id = str(machine.get("machineDisplayId") or mid)
+    address = str(machine.get("addressLine1") or machine.get("address") or "")
+    base = {
+        "id": int(mid) if mid is not None else None,
+        "display_id": display_id,
+        "address": address,
+        "configured": bool(address.strip()),
+    }
+    try:
+        raw_slots = fetch_machine_slots(token, mid)
+    except Exception as e:
+        logger.warning(f"Stock summary skip {mid}: {e}")
+        return {
+            **base,
+            "total_slots": 0, "active_slots": 0,
+            "empty_slots": 0, "low_slots": 0, "good_slots": 0, "issue_slots": 0,
+            "refill_needed": 0, "fill_percent": 0.0, "health": "unknown",
+            "fetch_failed": True,
+        }
+
+    empty = low = good = issue = disabled = 0
+    total_cur = total_cap = total_refill = 0
+    for raw in raw_slots:
+        norm = normalize_slot(raw)
+        if not norm:
+            continue
+        st = norm["status"]
+        if st == "disabled":
+            disabled += 1
+            continue
+        if st == "empty":
+            empty += 1
+        elif st == "low":
+            low += 1
+        elif st == "good":
+            good += 1
+        elif st == "issue":
+            issue += 1
+        total_cur += int(norm.get("current_qty", 0) or 0)
+        total_cap += int(norm.get("max_qty", 0) or 0)
+        total_refill += int(norm.get("refill_needed", 0) or 0)
+
+    active = empty + low + good + issue
+    fill_pct = round((total_cur / total_cap * 100), 1) if total_cap > 0 else 0.0
+
+    if active == 0 or total_cap == 0:
+        health = "unknown"
+    elif fill_pct < HEALTH_THRESHOLD_CRITICAL:
+        health = "critical"
+    elif fill_pct < HEALTH_THRESHOLD_LOW:
+        health = "low"
+    else:
+        health = "good"
+
+    return {
+        **base,
+        "total_slots": active + disabled,
+        "active_slots": active,
+        "empty_slots": empty, "low_slots": low, "good_slots": good,
+        "issue_slots": issue, "disabled_slots": disabled,
+        "refill_needed": total_refill,
+        "fill_percent": fill_pct,
+        "health": health,
+        "fetch_failed": False,
+    }
+
+
+@app.get("/machines/stock/summary")
+def stock_summary(request: Request):
+    token = extract_token(request, request.headers.get("authorization"))
     try:
         machines = fetch_machines(token)
-    except requests.HTTPError:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    except requests.HTTPError as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", 500)
+        if status == 401:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        raise HTTPException(status_code=502, detail="Vendolite error")
     except requests.RequestException:
         raise HTTPException(status_code=503, detail="Vendolite API unreachable")
 
-    all_data = []
-    for m in machines:
-        mid = m.get("id")
-        if mid is None:
-            continue
-        display_id = str(m.get("machineDisplayId") or mid)
-        address = str(m.get("addressLine1") or m.get("address") or "")
-        try:
-            all_data.append(_build_machine_data(token, mid, display_id, address))
-        except Exception as e:
-            logger.warning(f"Skipped machine {mid} in all-PDF: {e}")
-            continue
-    pdf_bytes = generate_refill_pdf(all_data)
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'attachment; filename="{_pdf_filename("all")}"'
-        },
-    )
+    if not machines:
+        return {
+            "totals": {"machines": 0, "critical": 0, "low": 0, "good": 0,
+                       "unconfigured": 0, "total_refill_needed": 0},
+            "machines": [],
+        }
+
+    workers = min(20, len(machines))
+    summaries: List[dict] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_machine_stock_summary, token, m): m for m in machines}
+        for fut in as_completed(futures):
+            try:
+                summaries.append(fut.result())
+            except Exception as e:
+                logger.warning(f"Stock summary future failed: {e}")
+
+    health_rank = {"critical": 0, "low": 1, "good": 2, "unknown": 3}
+    summaries.sort(key=lambda s: (
+        0 if s.get("configured") else 1,
+        health_rank.get(s.get("health"), 4),
+        -int(s.get("refill_needed", 0) or 0),
+        (s.get("address") or "").lower(),
+        s.get("display_id", ""),
+    ))
+    totals = {
+        "machines": len(summaries),
+        "critical": sum(1 for s in summaries if s.get("configured") and s["health"] == "critical"),
+        "low": sum(1 for s in summaries if s.get("configured") and s["health"] == "low"),
+        "good": sum(1 for s in summaries if s.get("configured") and s["health"] == "good"),
+        "unconfigured": sum(1 for s in summaries if not s.get("configured")),
+        "total_refill_needed": sum(int(s.get("refill_needed", 0) or 0) for s in summaries),
+    }
+    return {"totals": totals, "machines": summaries}
 
 
 # ── Machine Groups (Supabase) ───────────────────────────────────────────
@@ -794,19 +802,13 @@ def get_groups():
 
 
 @app.post("/groups")
-def create_group(body: dict):
+def create_group(body: GroupRequest):
     if not SUPABASE_URL:
         raise HTTPException(status_code=503, detail="Supabase not configured")
-    payload = {
-        "name": body.get("name"),
-        "machine_ids": body.get("machine_ids", []),
-        "display_ids": body.get("display_ids", []),
-        "addresses": body.get("addresses", []),
-    }
     resp = requests.post(
         f"{SUPABASE_URL}/rest/v1/machine_groups",
         headers=supabase_headers(),
-        json=payload,
+        json=body.model_dump() if hasattr(body, "model_dump") else body.dict(),
         timeout=10,
     )
     resp.raise_for_status()
@@ -814,19 +816,13 @@ def create_group(body: dict):
 
 
 @app.put("/groups/{group_id}")
-def update_group(group_id: str, body: dict):
+def update_group(group_id: str, body: GroupRequest):
     if not SUPABASE_URL:
         raise HTTPException(status_code=503, detail="Supabase not configured")
-    payload = {
-        "name": body.get("name"),
-        "machine_ids": body.get("machine_ids", []),
-        "display_ids": body.get("display_ids", []),
-        "addresses": body.get("addresses", []),
-    }
     resp = requests.patch(
         f"{SUPABASE_URL}/rest/v1/machine_groups?id=eq.{group_id}",
         headers=supabase_headers(),
-        json=payload,
+        json=body.model_dump() if hasattr(body, "model_dump") else body.dict(),
         timeout=10,
     )
     resp.raise_for_status()
@@ -857,14 +853,7 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/debug/raw_slots/{machine_id}")
-def debug_raw_slots(machine_id: int, token: str):
-    """Return the unparsed Vendolite slot payload so we can debug field shapes."""
-    try:
-        raw = fetch_machine_slots(token, machine_id)
-    except requests.HTTPError:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    except requests.RequestException:
-        raise HTTPException(status_code=503, detail="Vendolite API unreachable")
-    # Return only the first 3 slots to keep the response small
-    return {"machine_id": machine_id, "sample_slots": raw[:3], "total": len(raw)}
+# Note: /debug/raw_slots endpoint has been removed.
+# It was useful during initial debugging but is a data-exposure risk in
+# production. If you need to inspect raw Vendolite payloads, add a temporary
+# endpoint guarded by a secret header, then remove it.
