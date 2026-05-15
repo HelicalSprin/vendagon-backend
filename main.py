@@ -367,11 +367,14 @@ def _machine_stock_summary(token: str, machine: dict) -> dict:
     active = empty + low + good + issue
     fill_pct = round((total_cur / total_cap * 100), 1) if total_cap > 0 else 0.0
 
-    if active == 0:
+    # Health is driven by overall fill percentage so it matches the visual bar.
+    # Critical < 30%, Low < 60%, Good ≥ 60%. "unknown" only when there are no
+    # active slots at all (machine has no stock data yet).
+    if active == 0 or total_cap == 0:
         health = "unknown"
-    elif empty > 0 or issue > 0:
+    elif fill_pct < 30:
         health = "critical"
-    elif low > 0:
+    elif fill_pct < 60:
         health = "low"
     else:
         health = "good"
